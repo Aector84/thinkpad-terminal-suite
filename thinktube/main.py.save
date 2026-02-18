@@ -1,0 +1,175 @@
+import subprocess
+import json
+import os
+import socket
+import asyncio
+from pathlib import Path
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.widgets import Static, Input, ListView, ListItem, Label, ProgressBar
+
+VERSION = "2.1"
+HISTORY_FILE = Path.home() / ".tpvid_history.json"
+MPV_SOCKET = "/tmp/tpvid_socket"
+
+████████╗██████╗ ██╗   ██╗██╗██████╗ 
+╚══██╔══╝██╔══██╗██║   ██║██║██╔══██╗
+   ██║   ██████╔╝██║   ██║██║██║  ██║
+   ██║   ██╔═══╝ ██║   ██║██║██║  ██║
+   ██║   ██║     ╚██████╔╝██║██████╔╝
+   ╚═╝   ╚═╝      ╚═════╝ ╚═╝╚═════╝ 
+
+def youtube_search(query):
+    cmd = [
+        "yt-dlp",
+        f"ytsearch10:{query}",
+        "--print", "%(title)s|||%(webpage_url)s",
+        "--skip-download",
+        "--no-warnings"
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout.strip()
+    results = []
+    for line in output.split("\n"):
+        if "|||" in line:
+            title, url = line.split("|||", 1)
+            results.append((title.strip(), url.strip()))
+    return results
+
+
+class TPVid(App):
+
+    CSS = """
+    Screen { background: #111111; color: #cccccc; }
+
+    #left { width: 60%; }
+    #right { width: 40%; border-left: solid #333333; padding-left: 1; }
+
+    ListView { height: 20; border: round #333333; }
+
+    #footer { text-align: center; padding-top: 1; color: #777777; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(ASCII_HEADER)
+
+        with Horizontal():
+            with Vertical(id="left"):
+                self.search = Input(placeholder="Search YouTube...")
+                yield self.search
+                self.results = ListView()
+                yield self.results
+
+            with Vertical(id="right"):
+                self.now_playing = Static("Nothing playing")
+                yield self.now_playing
+                self.progress = ProgressBar(total=100)
+                yield self.progress
+                yield Static("Playlist")
+                self.playlist = ListView()
+                yield self.playlist
+
+        yield Static(
+            f"tpvid v{VERSION} | ENTER Play | a Add to Playlist | b Background | m Mini | q Quit",
+            id="footer"
+        )
+
+    def on_mount(self):
+        self.current_url = None
+        self.mpv_process = None
+        self.set_interval(1, self.update_progress)
+
+    def on_input_submitted(self, event):
+        self.results.clear()
+        for title, url in youtube_search(event.value):
+            item = ListItem(Label(title))
+            item.url = url
+            item.title = title
+            self.results.append(item)
+
+    def on_list_view_selected(self, event):
+        if event.list_view is self.results:
+            self.play(event.item.title, event.item.url)
+
+    def play(self, title, url, mini=False, background=False):
+
+        if os.path.exists(MPV_SOCKET):
+            os.remove(MPV_SOCKET)
+
+        args = [
+            "mpv",
+            url,
+            "--input-ipc-server=" + MPV_SOCKET,
+            "--force-window=yes",
+            "--no-terminal",
+            "--quiet",
+            "--fullscreen=no"
+        ]
+
+        if mini:
+            args += [
+                "--autofit=640x360",
+                "--geometry=640x360-40-40",
+                "--no-border",
+                "--ontop"
+            ]
+        else:
+            args += ["--autofit=960x540"]
+
+        if background:
+            args += ["--no-video"]
+
+        self.mpv_process = subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+        self.current_url = url
+        self.now_playing.update(f"Now Playing:\n{title}")
+
+
+    def update_progress(self):
+        if not os.path.exists(MPV_SOCKET):
+            return
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(MPV_SOCKET)
+                s.send(b'{ "command": ["get_property", "time-pos"] }\n')
+                response = json.loads(s.recv(1024).decode())
+                pos = response.get("data", 0)
+
+                s.send(b'{ "command": ["get_property", "duration"] }\n')
+                response = json.loads(s.recv(1024).decode())
+                dur = response.get("data", 1)
+
+                if dur:
+                    percent = int((pos / dur) * 100)
+                    self.progress.update(progress=percent)
+        except:
+            pass
+
+    def key_a(self):
+        if self.results.highlighted_child:
+            item = self.results.highlighted_child
+            new = ListItem(Label(item.title))
+            new.url = item.url
+            new.title = item.title
+            self.playlist.append(new)
+
+    def key_m(self):
+        if self.results.highlighted_child:
+            item = self.results.highlighted_child
+            self.play(item.title, item.url, mini=True)
+
+    def key_b(self):
+        if self.results.highlighted_child:
+            item = self.results.highlighted_child
+            self.play(item.title, item.url, background=True)
+
+    def key_q(self):
+        self.exit()
+
+
+if __name__ == "__main__":
+    TPVid().run()
